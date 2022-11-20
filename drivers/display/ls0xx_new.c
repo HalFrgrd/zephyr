@@ -42,10 +42,6 @@ LOG_MODULE_REGISTER(ls0xx, CONFIG_DISPLAY_LOG_LEVEL);
 #define LS0XX_BIT_VCOM        0x02
 #define LS0XX_BIT_CLEAR       0x04
 
-struct ls0xx_data {
-	enum display_orientation orientation;
-};
-
 struct ls0xx_config {
 	struct spi_dt_spec bus;
 #if DT_INST_NODE_HAS_PROP(0, disp_en_gpios)
@@ -58,15 +54,6 @@ struct ls0xx_config {
 
 static int ls0xx_cmd(const struct device *dev, uint8_t *buf, uint8_t len)
 {
-    // LOG_INF("Sending command of length %d", len);
-    // LOG_HEXDUMP_INF(buf,len,"hexdump");
-
-    static uint8_t vcom_mask = 0;
-
-    vcom_mask ^= LS0XX_BIT_VCOM;
-
-    buf[0] |= vcom_mask;
-
 	const struct ls0xx_config *config = dev->config;
 	struct spi_buf cmd_buf = { .buf = buf, .len = len };
 	struct spi_buf_set buf_set = { .buffers = &cmd_buf, .count = 1 };
@@ -78,41 +65,38 @@ static int ls0xx_cmd(const struct device *dev, uint8_t *buf, uint8_t len)
 #if DT_INST_NODE_HAS_PROP(0, extcomin_gpios)
 static void ls0xx_vcom_toggle(void *a, void *b, void *c)
 {
-	const struct device *dev = a;
-	const struct ls0xx_config *config = dev->config;
+	const struct ls0xx_config *config = a;
 
 	while (1) {
-        // LOG_INF("Toggling extcoming pin");
 		gpio_pin_toggle_dt(&config->extcomin_gpio);
 		k_usleep(3);
 		gpio_pin_toggle_dt(&config->extcomin_gpio);
 		k_msleep(1000 / DT_INST_PROP(0, extcomin_frequency));
 	}
 }
+
 #else
 static void ls0xx_vcom_toggle(void *a, void *b, void *c)
 {
-    return 0;
+    const struct device *dev = a;
+	const struct ls0xx_config *config = dev->config;
+	uint8_t vcom_toggle_cmd[2] = { 0, 0 };
+	int err;
 
-    // const struct device *dev = a;
-	// const struct ls0xx_config *config = dev->config;
-	// uint8_t vcom_toggle_cmd[2] = { 0, 0 };
-	// int err;
-
-    // while (1) {
-    //     vcom_toggle_cmd[0] ^= LS0XX_BIT_VCOM;
-    //     // LOG_INF("Sending vcom toggle command %d", vcom_toggle_cmd[0]);
-    //     err = ls0xx_cmd(dev, vcom_toggle_cmd, sizeof(vcom_toggle_cmd));
-    //     spi_release_dt(&config->bus);
-    //     // if(err) {
-    //     //     LOG_ERR("VCOM toggle command returned err %d", err);
-    //     // }
-	// 	k_msleep(1000 / DT_INST_PROP(0, extcomin_frequency));
-	// }
+    while (1) {
+        vcom_toggle_cmd[0] ^= LS0XX_BIT_VCOM;
+        LOG_INF("Sending vcom toggle command %d", vcom_toggle_cmd[0]);
+        err = ls0xx_cmd(dev, vcom_toggle_cmd, sizeof(vcom_toggle_cmd));
+        spi_release_dt(&config->bus);
+        if(err) {
+            LOG_ERR("VCOM toggle command returned err %d", err);
+        }
+		k_msleep(1000 / DT_INST_PROP(0, extcomin_frequency));
+	}
 }
 #endif
 
-K_THREAD_STACK_DEFINE(vcom_toggle_stack, 2048);
+K_THREAD_STACK_DEFINE(vcom_toggle_stack, 256);
 struct k_thread vcom_toggle_thread;
 
 static int ls0xx_blanking_off(const struct device *dev)
@@ -204,12 +188,11 @@ static int ls0xx_update_display(const struct device *dev,
 
 /* Buffer width should be equal to display width */
 static int ls0xx_write(const struct device *dev, const uint16_t x,
-		       const uint16_t y_not_orientated,
+		       const uint16_t y,
 		       const struct display_buffer_descriptor *desc,
 		       const void *buf)
 {
-
-    LOG_DBG("X: %d, Y: %d, W: %d, H: %d", x, y_not_orientated, desc->width, desc->height);
+	LOG_DBG("X: %d, Y: %d, W: %d, H: %d", x, y, desc->width, desc->height);
 
 	if (buf == NULL) {
 		LOG_WRN("Display buffer is not available");
@@ -226,7 +209,7 @@ static int ls0xx_write(const struct device *dev, const uint16_t x,
 		return -ENOTSUP;
 	}
 
-	if ((y_not_orientated + desc->height) > LS0XX_PANEL_HEIGHT) {
+	if ((y + desc->height) > LS0XX_PANEL_HEIGHT) {
 		LOG_ERR("Buffer out of bounds (height)");
 		return -EINVAL;
 	}
@@ -235,12 +218,6 @@ static int ls0xx_write(const struct device *dev, const uint16_t x,
 		LOG_ERR("X-coordinate has to be 0");
 		return -EINVAL;
 	}
-	uint16_t y = y_not_orientated;
-    struct ls0xx_data *data = dev->data;
-
-    if(data->orientation == DISPLAY_ORIENTATION_ROTATED_180){
-        y = 127-y_not_orientated;
-    }
 
 	/* Adding 1 since line numbering on the display starts with 1 */
 	return ls0xx_update_display(dev, y + 1, desc->height, buf);
@@ -277,29 +254,19 @@ static int ls0xx_set_contrast(const struct device *dev, uint8_t contrast)
 static void ls0xx_get_capabilities(const struct device *dev,
 				   struct display_capabilities *caps)
 {
-	struct ls0xx_data *data = dev->data;
-
 	memset(caps, 0, sizeof(struct display_capabilities));
 	caps->x_resolution = LS0XX_PANEL_WIDTH;
 	caps->y_resolution = LS0XX_PANEL_HEIGHT;
 	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01;
 	caps->current_pixel_format = PIXEL_FORMAT_MONO01;
 	caps->screen_info = SCREEN_INFO_X_ALIGNMENT_WIDTH;
-    caps->current_orientation = data->orientation;
 }
 
 static int ls0xx_set_orientation(const struct device *dev,
 				 const enum display_orientation orientation)
 {
-	struct ls0xx_data *data = dev->data;
-
-    if(orientation == DISPLAY_ORIENTATION_NORMAL || orientation == DISPLAY_ORIENTATION_ROTATED_180) {
-        data->orientation = orientation;
-        return 0;
-	} else {
-        LOG_ERR("Unsupported");
-        return -ENOTSUP;
-    }
+	LOG_ERR("Unsupported");
+	return -ENOTSUP;
 }
 
 static int ls0xx_set_pixel_format(const struct device *dev,
@@ -354,9 +321,6 @@ static int ls0xx_init(const struct device *dev)
 	/* Clear display else it shows random data */
 	return ls0xx_clear(dev);
 }
-static struct ls0xx_data ls0xx_data = {
-    .orientation = DISPLAY_ORIENTATION_NORMAL,
-};
 
 static const struct ls0xx_config ls0xx_config = {
 	.bus = SPI_DT_SPEC_INST_GET(
@@ -384,5 +348,5 @@ static struct display_driver_api ls0xx_driver_api = {
 	.set_orientation = ls0xx_set_orientation,
 };
 
-DEVICE_DT_INST_DEFINE(0, ls0xx_init, NULL, &ls0xx_data, &ls0xx_config, POST_KERNEL,
+DEVICE_DT_INST_DEFINE(0, ls0xx_init, NULL, NULL, &ls0xx_config, POST_KERNEL,
 		      CONFIG_DISPLAY_INIT_PRIORITY, &ls0xx_driver_api);
